@@ -1,0 +1,59 @@
+name: Bug report
+description: Report a reproducible problem with the skill or generated capture system
+title: "bug: "
+labels:
+  - bug
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Thanks for filing a bug. Please include enough detail for someone else to reproduce it.
+
+  - type: input
+    id: environment
+    attributes:
+      label: Agent and environment
+      description: Which agent/editor/runtime were you using?
+      placeholder: Claude Code on macOS, Cursor on macOS, etc.
+    validations:
+      required: true
+
+  - type: input
+    id: install_method
+    attributes:
+      label: Install method
+      description: How did you install the skill?
+      placeholder: npx skills add ..., manual clone, etc.
+    validations:
+      required: true
+
+  - type: textarea
+    id: prompt
+    attributes:
+      label: Prompt used
+      description: Paste the prompt or request that triggered the issue
+      placeholder: Capture marketing screenshots for my app across all locales...
+    validations:
+      required: true
+
+  - type: textarea
+    id: expected
+    attributes:
+      label: Expected behavior
+    validations:
+      required: true
+
+  - type: textarea
+    id: actual
+    attributes:
+      label: Actual behavior
+    validations:
+      required: true
+
+  - type: textarea
+    id: repro
+    attributes:
+      label: Reproduction steps
+      description: Include crash logs, console output, generated files, or screenshots if relevant
+    validations:
+      required: true

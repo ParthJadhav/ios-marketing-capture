@@ -1,0 +1,404 @@
+// TEMPLATE — reference patterns for building a marketing capture system.
+//
+// This is NOT copy-paste scaffolding. Every project has different navigation,
+// models, and views. Read the SKILL.md for the reasoning behind each pattern,
+// then compose the pieces that apply to your project.
+//
+// The three components:
+//   1. MarketingCapture enum     — launch arg parsing, output, window snapshot
+//   2. MarketingCaptureCoordinator — step-based screen capture loop
+//   3. MarketingElementHarness   — ImageRenderer for cards, widgets, charts
+//
+// See SKILL.md "Known Gotchas" for the reasoning behind every #if DEBUG hook.
+
+#if DEBUG
+import SwiftUI
+import UIKit
+
+// MARK: - Core utilities
+
+enum MarketingCapture {
+
+    // MARK: Launch argument
+
+    static var isActive: Bool {
+        ProcessInfo.processInfo.arguments.contains("-MarketingCapture") &&
+        value(for: "-MarketingCapture") == "1"
+    }
+
+    private static func value(for key: String) -> String? {
+        let args = ProcessInfo.processInfo.arguments
+        guard let idx = args.firstIndex(of: key), idx + 1 < args.count else { return nil }
+        return args[idx + 1]
+    }
+
+    // MARK: Locale
+
+    /// Folder name for per-locale output. Uses language code only to avoid
+    /// "en_US" vs "en" divergence from -AppleLocale.
+    static var localeFolder: String {
+        Locale.current.language.languageCode?.identifier
+            ?? Locale.current.identifier
+    }
+
+    // MARK: Priming vars
+    //
+    // Add one static var per view state you need to prime. The coordinator
+    // sets these before navigating, and the target view reads them in
+    // .onAppear under #if DEBUG. Reset them in the step's cleanup closure.
+    //
+    // Examples:
+    //   static var pendingElapsedSeconds: Int?
+    //   static var pendingShowOverlay: Bool = false
+
+    // MARK: Dismiss broadcast
+    //
+    // Used to force-dismiss a presented fullScreenCover / sheet whose
+    // item binding is held as @State inside an intermediate parent.
+    // See SKILL.md gotcha #4.
+
+    static let dismissSheetNotification = Notification.Name("MarketingCapture.dismissSheet")
+
+    // MARK: Output
+
+    static var outputRoot: URL {
+        let docs = FileManager.default.urls(for: .documentDirectory, in: .userDomainMask)[0]
+        let root = docs
+            .appendingPathComponent("marketing", isDirectory: true)
+            .appendingPathComponent(localeFolder, isDirectory: true)
+        try? FileManager.default.createDirectory(at: root, withIntermediateDirectories: true)
+        return root
+    }
+
+    static func writePNG(_ image: UIImage, name: String, subfolder: String? = nil) {
+        var dir = outputRoot
+        if let subfolder {
+            dir = dir.appendingPathComponent(subfolder, isDirectory: true)
+            try? FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
+        }
+        let url = dir.appendingPathComponent("\(name).png")
+        guard let data = image.pngData() else {
+            print("[MarketingCapture] failed to encode \(name)")
+            return
+        }
+        do {
+            try data.write(to: url, options: .atomic)
+            print("[MarketingCapture] wrote \(url.path)")
+        } catch {
+            print("[MarketingCapture] write failed: \(error)")
+        }
+    }
+
+    /// Writes a sentinel file so the shell script knows this locale is done.
+    static func writeSentinel() {
+        let url = outputRoot.appendingPathComponent("_done")
+        try? Data().write(to: url)
+    }
+
+    // MARK: Window snapshot
+
+    /// Captures the key UIWindow including any presented modals / sheets.
+    @MainActor
+    static func snapshotKeyWindow() -> UIImage? {
+        guard let window = UIApplication.shared.connectedScenes
+            .compactMap({ $0 as? UIWindowScene })
+            .flatMap({ $0.windows })
+            .first(where: { $0.isKeyWindow })
+        else { return nil }
+
+        let renderer = UIGraphicsImageRenderer(bounds: window.bounds)
+        return renderer.image { _ in
+            window.drawHierarchy(in: window.bounds, afterScreenUpdates: true)
+        }
+    }
+}
+
+// MARK: - Step-based coordinator
+
+/// Each step represents one screenshot: navigate → wait → snap → cleanup.
+struct CaptureStep {
+    let name: String                             // output filename, e.g. "01-home"
+    let navigate: @MainActor () -> Void          // put the app in the right state
+    let settle: Duration                         // wait for animations/data loads
+    let cleanup: (@MainActor () -> Void)?        // tear down before next step
+
+    init(
+        name: String,
+        settle: Duration = .milliseconds(1800),
+        navigate: @escaping @MainActor () -> Void,
+        cleanup: (@MainActor () -> Void)? = nil
+    ) {
+        self.name = name
+        self.navigate = navigate
+        self.settle = settle
+        self.cleanup = cleanup
+    }
+}
+
+@MainActor
+final class MarketingCaptureCoordinator {
+    static let shared = MarketingCaptureCoordinator()
+    private init() {}
+
+    /// Override per-step settle time with a floor. Useful if you find
+    /// 1800ms isn't enough for heavy screens (charts, large lists).
+    var minimumSettle: Duration = .milliseconds(1800)
+
+    func run(steps: [CaptureStep], then elements: () async -> Void) async {
+        print("[MarketingCapture] run for locale=\(MarketingCapture.localeFolder)")
+
+        for step in steps {
+            step.navigate()
+            let settle = max(step.settle, minimumSettle)
+            try? await Task.sleep(for: settle)
+
+            guard let image = MarketingCapture.snapshotKeyWindow() else {
+                print("[MarketingCapture] snapshot failed: \(step.name)")
+                continue
+            }
+            MarketingCapture.writePNG(image, name: step.name)
+
+            if let cleanup = step.cleanup {
+                cleanup()
+                // Allow cleanup animations (sheet dismiss, navigation pop)
+                try? await Task.sleep(for: .milliseconds(900))
+            }
+        }
+
+        // Element renders (cards, widgets, charts)
+        await elements()
+
+        MarketingCapture.writeSentinel()
+        print("[MarketingCapture] done for locale=\(MarketingCapture.localeFolder)")
+    }
+}
+
+// MARK: - Element harness
+
+enum MarketingElementHarness {
+
+    // MARK: Cards
+
+    /// Renders a SwiftUI view as an isolated PNG element with background
+    /// and rounded corners. Use for list rows, carousel cards, tiles.
+    @MainActor
+    static func renderElement<V: View>(
+        name: String,
+        width: CGFloat,
+        height: CGFloat? = nil,
+        cornerRadius: CGFloat = 20,
+        background: Color,
+        @ViewBuilder content: () -> V
+    ) {
+        let view = content()
+            .frame(width: width, height: height)
+            .background(background)
+            .clipShape(RoundedRectangle(cornerRadius: cornerRadius, style: .continuous))
+
+        let renderer = ImageRenderer(content: view)
+        renderer.scale = 3
+        renderer.isOpaque = false
+        renderer.proposedSize = .init(width: width, height: height)
+
+        guard let image = renderer.uiImage else {
+            print("[MarketingCapture] element render failed: \(name)")
+            return
+        }
+        MarketingCapture.writePNG(image, name: name, subfolder: "elements")
+    }
+
+    // MARK: Widgets
+    //
+    // Standard iPhone widget sizes (points, iPhone 14-17 size class).
+    // Adjust if targeting iPad or a specific device family.
+
+    enum WidgetSize {
+        static let small  = CGSize(width: 170, height: 170)
+        static let medium = CGSize(width: 364, height: 170)
+        static let large  = CGSize(width: 364, height: 382)
+        static let accessoryCircular    = CGSize(width: 76, height: 76)
+        static let accessoryRectangular = CGSize(width: 172, height: 76)
+        static let accessoryInline      = CGSize(width: 257, height: 26)
+    }
+
+    /// Renders a widget view with the padding and corner radius that
+    /// WidgetKit normally provides. See SKILL.md gotchas #7, #8.
+    @MainActor
+    static func renderWidget<V: View>(
+        name: String,
+        size: CGSize,
+        cornerRadius: CGFloat? = nil,
+        background: Color,
+        @ViewBuilder content: () -> V
+    ) {
+        let isAccessory = size.height <= 80
+        let radius = cornerRadius ?? (isAccessory ? 8 : 22)
+        let contentPadding: CGFloat = isAccessory ? 0 : 16
+
+        let view = content()
+            .padding(contentPadding)
+            .frame(width: size.width, height: size.height)
+            .background(background)
+            .clipShape(RoundedRectangle(cornerRadius: radius, style: .continuous))
+            .environment(\.colorScheme, .light)
+
+        let renderer = ImageRenderer(content: view)
+        renderer.scale = 3
+        renderer.isOpaque = false
+        renderer.proposedSize = .init(width: size.width, height: size.height)
+
+        guard let image = renderer.uiImage else {
+            print("[MarketingCapture] widget render failed: \(name)")
+            return
+        }
+        MarketingCapture.writePNG(image, name: name, subfolder: "elements")
+    }
+
+    // MARK: Helpers
+
+    static func slugify(_ s: String) -> String {
+        s.lowercased()
+            .replacingOccurrences(of: " ", with: "-")
+            .filter { $0.isLetter || $0.isNumber || $0 == "-" }
+    }
+}
+#endif
+
+// ============================================================================
+// INTEGRATION GUIDE
+// ============================================================================
+//
+// 1. ROOT VIEW (.onAppear hook)
+//
+//    Add this to your root view's .onAppear, AFTER existing VM setup calls:
+//
+//    #if DEBUG
+//    if MarketingCapture.isActive {
+//        // (a) End stale Live Activities (skip if app doesn't use ActivityKit)
+//        ActivityManager.shared.endImmediately()
+//
+//        // (b) Seed data only if empty (store persists across relaunches)
+//        itemVM.fetch()
+//        if itemVM.items.isEmpty {
+//            DemoDataSeeder.seedIfEmpty(in: modelContext)
+//            itemVM.fetch()
+//        }
+//
+//        // (c) Refresh any VM that setup() before the seed
+//        otherVM.refresh()
+//
+//        // (d) Suppress onboarding
+//        showOnboarding = false
+//
+//        // (e) Build steps and run
+//        Task {
+//            try? await Task.sleep(for: .milliseconds(500))
+//
+//            let steps: [CaptureStep] = [
+//                // Tab switch — no cleanup needed
+//                CaptureStep(name: "01-home") { setTab(0) },
+//
+//                // Presented detail on tab 0
+//                CaptureStep(name: "02-detail") {
+//                    setTab(0)
+//                    showDetail = true
+//                } cleanup: {
+//                    showDetail = false
+//                },
+//
+//                // Clean tab BEFORE pushing onto its stack (gotcha #5)
+//                CaptureStep(name: "03-list") { setTab(1) },
+//
+//                // Push onto tab 1's stack — after clean capture
+//                CaptureStep(name: "04-item-detail") {
+//                    setTab(1)
+//                    deepLinkItem = items.first
+//                } cleanup: {
+//                    deepLinkItem = nil
+//                },
+//
+//                // Sheet with primed state
+//                CaptureStep(name: "05-timer", settle: .milliseconds(2400)) {
+//                    MarketingCapture.pendingElapsedSeconds = 75
+//                    pendingSheetItem = someItem
+//                } cleanup: {
+//                    MarketingCapture.pendingElapsedSeconds = nil
+//                    NotificationCenter.default.post(
+//                        name: MarketingCapture.dismissSheetNotification,
+//                        object: nil
+//                    )
+//                    pendingSheetItem = nil
+//                },
+//
+//                // Last tab — no stack state to worry about
+//                CaptureStep(name: "06-settings") { setTab(4) },
+//            ]
+//
+//            await MarketingCaptureCoordinator.shared.run(steps: steps) {
+//                // Element renders
+//                let theme = themeManager.theme(for: .light)
+//                for item in itemVM.items {
+//                    MarketingElementHarness.renderElement(
+//                        name: "card-\(MarketingElementHarness.slugify(item.name))",
+//                        width: 380,
+//                        cornerRadius: 20,
+//                        background: theme.background
+//                    ) {
+//                        ItemCard(item: item, theme: theme)
+//                            .padding(.horizontal, 16)
+//                            .padding(.vertical, 12)
+//                    }
+//                }
+//                // Widgets (requires widget files in main target — gotcha #6)
+//                MarketingElementHarness.renderWidget(
+//                    name: "widget-pulse-small",
+//                    size: MarketingElementHarness.WidgetSize.small,
+//                    background: theme.background
+//                ) {
+//                    PulseSmallView(entry: .preview)
+//                }
+//            }
+//        }
+//    }
+//    #endif
+//
+//
+// 2. PRESENTED VIEWS (dismiss listener)
+//
+//    Any view presented via .fullScreenCover or .sheet that the coordinator
+//    needs to dismiss between steps must listen for the broadcast:
+//
+//    #if DEBUG
+//    .onReceive(NotificationCenter.default.publisher(
+//        for: MarketingCapture.dismissSheetNotification
+//    )) { _ in
+//        // Stop any ongoing work (timers, animations)
+//        timerVM.stop()
+//        dismiss()
+//    }
+//    #endif
+//
+//
+// 3. PRIMED VIEWS (.onAppear hook)
+//
+//    Views captured in a non-default state read priming vars on appear:
+//
+//    .onAppear {
+//        #if DEBUG
+//        if MarketingCapture.isActive,
+//           let elapsed = MarketingCapture.pendingElapsedSeconds {
+//            phase = .active
+//            timerVM.elapsedTime = TimeInterval(elapsed)
+//            timerVM.start()
+//            DispatchQueue.main.asyncAfter(deadline: .now() + 0.2) {
+//                timerVM.pause()
+//            }
+//        }
+//        #endif
+//    }
+//
+//    .onDisappear {
+//        #if DEBUG
+//        if MarketingCapture.isActive { timerVM.stop() }
+//        #endif
+//    }
